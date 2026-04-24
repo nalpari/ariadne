@@ -1,0 +1,450 @@
+# Sprint 0 — Foundation Design
+
+**Project:** Ariadne (AI 기반 E2E 테스트 자동화 애플리케이션)
+**Date:** 2026-04-24
+**Sprint:** 0 (Foundation)
+**Status:** Approved by user
+
+---
+
+## 0. Decomposition Context
+
+The full feature spec (`docs/AI 기반 E2E 테스트 자동화 애플리케이션_기능명세서_2026-04-24.md`) defines six feature areas. Attempting one spec for all six would be unmanageable, so the product is decomposed into sprints:
+
+| Sprint | Focus |
+|---|---|
+| **0. Foundation** (this spec) | App shell, DB, auth, job queue, real-time, Claude+Playwright wiring, Docker |
+| **1. MVP Critical Path** | URL → AI scenario extraction → Excel download → Playwright execution → minimal result view |
+| **2. Dashboard** | Aggregate charts, time-series, filters, PDF/CSV reports, email delivery |
+| **3. Scenario Management** | Save / edit / delete / version / diff / rollback |
+| **4. Multi-tenancy** | Email auth upgrade, multi-project, access permissions, 2FA |
+
+Each sprint owns its own spec → plan → implementation cycle.
+
+---
+
+## 1. Goal & Scope
+
+**When Sprint 0 is done, later sprints can focus on feature code only.** Concretely the following must work end-to-end:
+
+- `docker build` produces one image that runs both the Next.js app and the background worker.
+- The running stack boots, connects to Supabase Cloud, and a visitor is auto-signed-in with an anonymous session.
+- Database schema for MVP tables is applied via migration, with RLS policies enforced from day one and `user_id = auth.uid()` as the default rule.
+- A dev-only smoke harness page (`/dev/smoke`, gated by `ENABLE_DEV_HARNESS=true`) can trigger two sample jobs:
+  - `sample.ping` — creates a scratch `test_target` + `test_run`, enqueues, worker echoes the payload as a `test_run_events` row, UI receives it via Realtime.
+  - `sample.claude` — same flow, but the handler runs Claude Agent SDK + Playwright MCP against a public URL and records the page `<title>` as a `log` event. This proves the AI-drives-browser pipeline is alive.
+- UI shell (layout, navigation, theme toggle) and Tailwind 4 design tokens are in place.
+- Structured logging and Sentry error capture are wired for both processes.
+
+### Explicit non-goals (YAGNI)
+
+Deferred to later sprints, even if tempting to start now:
+
+- AI scenario extraction logic (→ Sprint 1)
+- Excel (XLSX) export (→ Sprint 1)
+- Real E2E execution pipeline beyond the sample job (→ Sprint 1)
+- Dashboard aggregate charts, PDF/CSV reports (→ Sprint 2)
+- Scenario versioning, diff viewer, rollback (→ Sprint 3)
+- Email delivery, 2FA, per-project permissions (→ Sprint 4)
+- Cross-browser (Firefox/WebKit) — Chromium only for Sprint 0
+- Parallel test execution, pause/resume (→ Sprint 1 or 2)
+- bull-board / pg-boss admin UI
+- CI/CD pipeline, production deploy recipes
+
+---
+
+## 2. Architecture Overview
+
+```
+ ┌─────────────────────────────────────────┐
+ │      Docker container (single image)    │
+ │                                         │
+ │  [Next.js 16 app]      [Worker process] │
+ │    - RSC UI              - pg-boss poll │
+ │    - API routes          - Claude Agent │
+ │    - anon sign-in        - Playwright MCP│
+ │                                         │
+ │  both processes managed by `concurrently`│
+ └────────────┬────────────────┬───────────┘
+              │                │
+              ▼                ▼
+     ┌──────────────────────────────┐
+     │   Supabase Cloud (managed)   │
+     │   - Postgres (schema + pg-boss│
+     │     + storage)               │
+     │   - Auth (anonymous)         │
+     │   - Realtime (postgres_changes│
+     │   - Storage (screenshots)    │
+     └──────────────────────────────┘
+```
+
+**Confirmed architectural decisions (from brainstorming):**
+
+| Decision | Choice | Reason |
+|---|---|---|
+| Deployment target | Single Docker container on a VPS-class host (B) | Long-running Playwright + worker, no serverless limits, easy self-host |
+| Supabase hosting | Supabase Cloud (A) | Avoid self-host operational overhead at MVP stage |
+| Auth strategy | Anonymous Auth + RLS from day one (C) | Clean upgrade path to Sprint 4 email auth without data migration |
+| AI + browser | Claude Agent SDK + Playwright MCP (A) | Official Anthropic path; agent loop, caching, isolation handled by SDK |
+| Job queue + realtime | pg-boss + Supabase Realtime (A) | Postgres-only stack; reuses infrastructure already in place |
+
+**Locked stack:** Next.js 16 / React 19 / Tailwind 4 / TypeScript 5 / Supabase Cloud / `@anthropic-ai/claude-agent-sdk` / `@playwright/mcp` / `pg-boss` / shadcn/ui / Zod / pino / Sentry / Vitest / Playwright (for self-smoke-test only) / `concurrently` + `tsx`.
+
+---
+
+## 3. Directory Structure
+
+```
+ariadne/
+├── Dockerfile
+├── docker-compose.yml              # local dev convenience
+├── .env.example
+├── supabase/
+│   ├── config.toml                 # supabase CLI link to cloud project
+│   └── migrations/
+│       ├── 0001_init_schema.sql
+│       ├── 0002_rls_policies.sql
+│       └── 0003_realtime_publication.sql
+├── src/
+│   ├── app/                        # Next.js app router
+│   │   ├── layout.tsx              # root shell + theme provider
+│   │   ├── page.tsx                # landing placeholder
+│   │   ├── (auth)/
+│   │   │   └── anon-bootstrap.tsx  # client component for anon sign-in
+│   │   ├── api/
+│   │   │   ├── health/route.ts     # liveness probe
+│   │   │   └── dev/sample/route.ts # dev-only: create scratch run + enqueue
+│   │   └── dev/
+│   │       └── smoke/page.tsx      # dev-only smoke harness (env-gated)
+│   ├── components/
+│   │   ├── ui/                     # shadcn/ui primitives
+│   │   └── shell/                  # Nav, ThemeToggle, ErrorBoundary
+│   ├── lib/
+│   │   ├── env.ts                  # Zod-validated env
+│   │   ├── supabase/
+│   │   │   ├── server.ts           # RSC / route handler client
+│   │   │   ├── browser.ts          # "use client" client
+│   │   │   └── service.ts          # service_role (worker only)
+│   │   ├── claude.ts               # Claude Agent SDK wrapper + prompt caching
+│   │   ├── jobs/
+│   │   │   ├── client.ts           # enqueue() typed helpers
+│   │   │   ├── registry.ts         # JobType → handler map
+│   │   │   └── types.ts            # Zod-validated job payloads
+│   │   ├── realtime.ts             # subscribe helpers
+│   │   └── logger.ts               # pino instance
+│   └── styles/
+│       └── tokens.css              # Tailwind 4 @theme tokens
+├── worker/
+│   ├── index.ts                    # entry: boot pg-boss, load MCP, register handlers
+│   ├── browser.ts                  # Playwright MCP session factory
+│   └── handlers/
+│       ├── ping.ts                 # sample job (remove in Sprint 1)
+│       └── claude-sample.ts        # sample claude+playwright job (remove in Sprint 1)
+├── tests/
+│   └── smoke.spec.ts               # Playwright smoke test against running stack
+└── package.json                    # adds: dev = concurrently "next dev" "tsx worker"
+```
+
+---
+
+## 4. Database Schema
+
+MVP-level tables only. Sprint 2–4 add their own migrations.
+
+### 4.1 Tables (`supabase/migrations/0001_init_schema.sql`)
+
+```sql
+create extension if not exists pgcrypto;
+
+-- Test targets: a URL + optional auth/config the user wants to test.
+create table public.test_targets (
+  id         uuid primary key default gen_random_uuid(),
+  user_id    uuid not null references auth.users(id) on delete cascade,
+  url        text not null,
+  name       text,
+  config     jsonb not null default '{}'::jsonb,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+-- Scenarios extracted by AI or entered/edited by the user.
+-- No versioning in MVP — Sprint 3 adds scenario_versions.
+create table public.scenarios (
+  id         uuid primary key default gen_random_uuid(),
+  target_id  uuid not null references public.test_targets(id) on delete cascade,
+  user_id    uuid not null references auth.users(id) on delete cascade,
+  title      text not null,
+  tags       text[] not null default '{}',
+  steps      jsonb not null,                 -- array of {action, selector, value, expected}
+  source     text not null check (source in ('ai', 'user', 'edited')),
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+-- Execution runs.
+create table public.test_runs (
+  id           uuid primary key default gen_random_uuid(),
+  user_id      uuid not null references auth.users(id) on delete cascade,
+  target_id    uuid not null references public.test_targets(id) on delete cascade,
+  scenario_ids uuid[] not null,
+  status       text not null check (status in ('queued','running','passed','failed','cancelled')),
+  started_at   timestamptz,
+  finished_at  timestamptz,
+  created_at   timestamptz not null default now()
+);
+
+-- Append-only event stream — Realtime subscribes here.
+create table public.test_run_events (
+  id          bigserial primary key,
+  run_id      uuid not null references public.test_runs(id) on delete cascade,
+  user_id     uuid not null,                -- denormalized for RLS
+  scenario_id uuid,
+  step_index  int,
+  kind        text not null,                -- 'step_start'|'step_pass'|'step_fail'|'log'|'screenshot'
+  payload     jsonb not null default '{}'::jsonb,
+  created_at  timestamptz not null default now()
+);
+create index on public.test_run_events (run_id, id);
+```
+
+pg-boss manages its own schema (default `pgboss`) via its install routine on first boot.
+
+### 4.2 RLS (`0002_rls_policies.sql`)
+
+Every user-owned table enables RLS with a single policy pattern:
+
+```sql
+alter table public.test_targets     enable row level security;
+alter table public.scenarios        enable row level security;
+alter table public.test_runs        enable row level security;
+alter table public.test_run_events  enable row level security;
+
+create policy "owner_all" on public.test_targets
+  for all using (user_id = auth.uid()) with check (user_id = auth.uid());
+create policy "owner_all" on public.scenarios
+  for all using (user_id = auth.uid()) with check (user_id = auth.uid());
+create policy "owner_all" on public.test_runs
+  for all using (user_id = auth.uid()) with check (user_id = auth.uid());
+create policy "owner_all" on public.test_run_events
+  for all using (user_id = auth.uid()) with check (user_id = auth.uid());
+```
+
+The worker uses the service role key and bypasses RLS. All denormalized `user_id` columns on `test_run_events` are populated by the worker when writing events, so Realtime subscriptions filter correctly on the client.
+
+### 4.3 Realtime publication (`0003_realtime_publication.sql`)
+
+```sql
+alter publication supabase_realtime add table public.test_runs;
+alter publication supabase_realtime add table public.test_run_events;
+```
+
+Other tables are not added to the publication — they are not consumed as streams.
+
+### 4.4 Storage
+
+Bucket `run-artifacts` (private). Path convention:
+`/{user_id}/{run_id}/{step_index}-{type}.{ext}` (types: `screenshot`, `trace`, `log`).
+Storage RLS: read/write allowed only when the path prefix equals `auth.uid()`.
+
+---
+
+## 5. Job Queue & Realtime
+
+### 5.1 Typed job definitions (`src/lib/jobs/types.ts`)
+
+```ts
+import { z } from 'zod';
+
+export const jobSchemas = {
+  'scenario.extract': z.object({
+    targetId: z.string().uuid(),
+    userId:   z.string().uuid(),
+  }),
+  'run.execute': z.object({
+    runId:  z.string().uuid(),
+    userId: z.string().uuid(),
+  }),
+  'sample.ping': z.object({
+    runId:  z.string().uuid(),
+    userId: z.string().uuid(),
+    echo:   z.string(),
+  }),
+  'sample.claude': z.object({
+    runId:  z.string().uuid(),
+    userId: z.string().uuid(),
+    url:    z.string().url(),
+  }),
+} as const;
+
+export type JobType = keyof typeof jobSchemas;
+export type JobPayload<T extends JobType> = z.infer<typeof jobSchemas[T]>;
+```
+
+In Sprint 0 only `sample.ping` and `sample.claude` have handlers. `scenario.extract` and `run.execute` are declared as types-only stubs so Sprint 1 just implements handlers without modifying the registry. The `/api/dev/sample` route (env-gated) creates a scratch `test_target` (url: `about:blank` for ping, user-supplied for claude) and scratch `test_run`, then enqueues the sample job with the resulting `runId`.
+
+### 5.2 Enqueue helper (`src/lib/jobs/client.ts`)
+
+```ts
+export async function enqueue<T extends JobType>(type: T, payload: JobPayload<T>) {
+  jobSchemas[type].parse(payload);      // runtime validation
+  return pgboss.send(type, payload, { retryLimit: 3, retryBackoff: true });
+}
+```
+
+### 5.3 Worker registration
+
+`worker/index.ts` boots pg-boss, then for each handler calls `pgboss.work(type, handler)`. Handlers receive validated payloads and a helper `emitEvent(runId, kind, payload)` that INSERTs into `test_run_events` using the service-role client.
+
+### 5.4 Realtime consumption
+
+`src/lib/realtime.ts` exposes `subscribeRunEvents(runId, onEvent)` which wraps:
+
+```ts
+supabase.channel(`run:${runId}`)
+  .on('postgres_changes',
+      { event: 'INSERT', schema: 'public', table: 'test_run_events',
+        filter: `run_id=eq.${runId}` },
+      (payload) => onEvent(payload.new))
+  .subscribe();
+```
+
+RLS guarantees the subscribed client only receives its own events.
+
+---
+
+## 6. Claude Agent SDK + Playwright MCP
+
+### 6.1 Claude client wrapper (`src/lib/claude.ts`)
+
+```ts
+import { ClaudeSDKClient } from '@anthropic-ai/claude-agent-sdk';
+
+export function createClaudeClient(opts?: { cache?: boolean }) {
+  return new ClaudeSDKClient({
+    apiKey: env.ANTHROPIC_API_KEY,
+    model:  env.CLAUDE_MODEL,             // defaults to 'claude-opus-4-7'
+    cache:  opts?.cache ?? true,          // prompt caching on fixed system prompts
+  });
+}
+```
+
+### 6.2 Playwright MCP session factory (`worker/browser.ts`)
+
+Each job spawns a fresh MCP session for isolation:
+
+```ts
+export async function withMcpSession(run: (tools: McpToolset) => Promise<Result>) {
+  const mcp = await startMcpServer({
+    command: 'npx',
+    args:    ['@playwright/mcp', '--headless', '--chromium'],
+    transport: 'stdio',
+  });
+  try {
+    return await run(mcp.toolset);
+  } finally {
+    await uploadArtifacts(mcp);           // screenshots, traces → Supabase Storage
+    await mcp.close();
+  }
+}
+```
+
+### 6.3 Sample handler (`worker/handlers/claude-sample.ts`)
+
+Registered as `sample.claude`. Input: `{ runId, userId, url }`. Behavior: Claude is given the Playwright MCP toolset and a prompt "Navigate to this URL, read the page title, and report it." Result is written as a `log` event on `test_run_events` (`run_id = runId`). This handler exists **only to prove the full pipeline works**; Sprint 1 removes it and replaces it with the real `scenario.extract` handler.
+
+---
+
+## 7. UI Shell & Design Tokens
+
+- `npx shadcn@latest init` with Tailwind 4 preset to populate `src/components/ui/`.
+- `src/styles/tokens.css` defines the design tokens under Tailwind 4's `@theme` block: color, radius, shadow, typography scales. Dark mode via `@media (prefers-color-scheme)` plus a user toggle persisted to `localStorage`.
+- Root layout provides: left sidebar (placeholder nav), top bar ("Ariadne" + theme toggle), main content.
+- `ErrorBoundary` and `Suspense` boundaries at the layout level.
+
+**Framework note:** Next.js 16 has breaking changes (per `AGENTS.md` at the repo root). Implementation must read `node_modules/next/dist/docs/` before writing app-router code.
+
+---
+
+## 8. Anonymous Auth
+
+- `src/app/(auth)/anon-bootstrap.tsx` is a client component that, on mount, checks `supabase.auth.getSession()` and, if none, calls `signInAnonymously()`.
+- Mounted inside a `<Suspense fallback={null}>` in the root layout so it does not block initial render.
+- **Sprint 4 upgrade path:** when an email signup UI is added, calling `supabase.auth.updateUser({ email, password })` converts the existing anon session into a permanent account. Foreign keys on `user_id` remain stable across the transition.
+
+---
+
+## 9. Environment & Secrets
+
+`.env.example`:
+
+```
+NEXT_PUBLIC_SUPABASE_URL=
+NEXT_PUBLIC_SUPABASE_ANON_KEY=
+SUPABASE_SERVICE_ROLE_KEY=        # worker only, never shipped to client bundle
+ANTHROPIC_API_KEY=
+SENTRY_DSN=
+LOG_LEVEL=info
+CLAUDE_MODEL=claude-opus-4-7
+ENABLE_DEV_HARNESS=false          # set true to expose /dev/smoke and /api/dev/*
+```
+
+- `src/lib/env.ts` validates with Zod at module import. Client-visible vs server-only keys are split into two schemas.
+- `SUPABASE_SERVICE_ROLE_KEY` may only be imported from `src/lib/supabase/service.ts`. An ESLint rule (`no-restricted-imports`) enforces this.
+
+---
+
+## 10. Docker Packaging
+
+`Dockerfile` (multi-stage):
+
+1. `deps` — `npm ci` + `npx playwright install chromium --with-deps`.
+2. `build` — `next build`.
+3. `runtime` — Node 20 slim + build artifacts + Playwright runtime libs (glibc etc.).
+4. CMD: `concurrently -k "next start" "tsx worker/index.ts"`.
+
+`docker-compose.yml` (local dev convenience): one `app` service, `.env` bind mount, port 3000 mapped, health check hits `/api/health`.
+
+---
+
+## 11. Testing & Linting
+
+- **Vitest:** unit tests for `src/lib/**` — Zod schemas, env parser, `enqueue()` helpers.
+- **Playwright (self-dogfood):** `tests/smoke.spec.ts` — boot the container, load the home page, observe anon-session cookie set, enqueue `sample.ping`, verify the Realtime event arrives.
+- **ESLint:** Next.js 16 recommended config + the `no-restricted-imports` rule above.
+- CI/CD is out of scope for Sprint 0. Local `npm run test` passing is sufficient.
+
+---
+
+## 12. Observability
+
+- `src/lib/logger.ts` exports a pino instance. Dev uses `pino-pretty`; production emits JSON.
+- Sentry initialized via Next.js 16's `instrumentation.ts` for the app and at the top of `worker/index.ts` for the worker.
+- Every worker handler creates `logger.child({ jobId, jobType })` so logs are correlated per job.
+
+---
+
+## 13. Risk & Mitigation
+
+| Risk | Mitigation |
+|---|---|
+| Playwright runtime libs bloat the image | Multi-stage build; install browsers only in `runtime` stage, not final layers that re-build |
+| Service role key leak via client bundle | Dedicated module + ESLint `no-restricted-imports`; service module imports fail in client components |
+| Anonymous sessions accumulating in `auth.users` | Out of scope for Sprint 0; Sprint 4 adds a cleanup job for unclaimed anon users >30d |
+| MCP server process leaks on worker crash | pg-boss retry + `withMcpSession` `finally`-block close; container-level restart policy as safety net |
+| Claude API cost during development | Prompt caching on by default; sample handler runs only on explicit demo |
+| Next.js 16 API surprises vs. training data | Spec mandates reading `node_modules/next/dist/docs/` before each Next.js-specific change |
+
+---
+
+## 14. Definition of Done
+
+Sprint 0 is complete when **all** of the following are true:
+
+1. `docker build` produces one image and `docker run` boots both processes.
+2. Loading `http://localhost:3000` creates an anon session (visible in Application → Cookies and `auth.users`).
+3. Running `supabase db push` applies the three migrations cleanly against the cloud project.
+4. With `ENABLE_DEV_HARNESS=true`, visiting `/dev/smoke` and triggering `sample.ping` creates a scratch `test_run` and a matching `test_run_events` row; the browser receives it via Realtime within 2 seconds.
+5. Triggering `sample.claude` from `/dev/smoke` against a public URL returns a non-empty `<title>` via Claude + Playwright MCP and writes it as a `log` event.
+6. `npm run test` (Vitest + Playwright smoke) is green.
+7. Sentry DSN + Supabase env vars are wired; disabling Sentry DSN does not crash the app.
+8. ESLint passes, including the `no-restricted-imports` rule.
