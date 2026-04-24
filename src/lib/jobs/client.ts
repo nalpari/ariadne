@@ -1,11 +1,11 @@
-import PgBoss from "pg-boss";
+import { PgBoss } from "pg-boss";
 import { serverEnv } from "@/lib/env";
 import { type JobPayload, type JobType, parseJobPayload } from "@/lib/jobs/types";
 
 type BossSender = Pick<PgBoss, "send">;
 
 export function createBoss() {
-  return new PgBoss({ connectionString: serverEnv.DATABASE_URL });
+  return new PgBoss(serverEnv.DATABASE_URL);
 }
 
 export function createEnqueue(boss: BossSender) {
