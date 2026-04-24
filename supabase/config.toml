@@ -1,0 +1,13 @@
+project_id = "ariadne"
+
+[api]
+enabled = true
+
+[db]
+major_version = 15
+
+[realtime]
+enabled = true
+
+[storage]
+enabled = true
