@@ -34,3 +34,15 @@ You can check out [the Next.js GitHub repository](https://github.com/vercel/next
 The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
 
 Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+
+## Sprint 0 Local Verification
+
+1. Copy `.env.example` to `.env` and set Supabase, Anthropic, and database values.
+2. Run `supabase db push` against the linked Supabase Cloud project.
+3. Set `ENABLE_DEV_HARNESS=true` and `NEXT_PUBLIC_ENABLE_DEV_HARNESS=true`.
+4. Run `npm run dev`.
+5. Open `http://localhost:3000/dev/smoke`.
+6. Run `sample.ping` and confirm a `log` event appears.
+7. Run `sample.claude` with `https://example.com` and confirm a title appears.
+8. Run `npm run test`, `npm run lint`, and `npm run typecheck`.
+9. Run `docker build -t ariadne:sprint-0 .`.
